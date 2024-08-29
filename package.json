@@ -1,0 +1,26 @@
+{
+  "name": "telegram-file-bot",
+  "version": "1.0.0",
+  "description": "A Telegram bot that downloads, splits, and sends large files.",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js"
+  },
+  "dependencies": {
+    "node-telegram-bot-api": "^0.61.0",
+    "request": "^2.88.2",
+    "sqlite3": "^5.1.6"
+  },
+  "engines": {
+    "node": ">=14.0.0"
+  },
+  "keywords": [
+    "telegram",
+    "bot",
+    "file",
+    "split",
+    "download"
+  ],
+  "author": "Your Name",
+  "license": "MIT"
+}
