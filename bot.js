@@ -6,7 +6,7 @@ const sqlite3 = require('sqlite3').verbose();
 const TelegramBot = require('node-telegram-bot-api');
 
 // Replace with your bot token and desired port number
-const BOT_TOKEN = 'YOUR_BOT_TOKEN_HERE';
+const BOT_TOKEN = '7448594075:AAFMCpeHgz1sjE7LgN0XMyPW14Bz8x2qab8';
 const PORT = process.env.PORT || 3000;  // You can change the port number as needed
 const CHUNK_SIZE = 49 * 1024 * 1024; // 49 MB
 
