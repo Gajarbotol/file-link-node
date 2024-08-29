@@ -1,186 +1,180 @@
-const TelegramBot = require('node-telegram-bot-api');
+const { Telegraf } = require('telegraf');
+const axios = require('axios');
 const fs = require('fs');
-const request = require('request');
-const sqlite3 = require('sqlite3').verbose();
 const path = require('path');
+const express = require('express');
 
 // Replace with your bot token
 const BOT_TOKEN = '7448594075:AAFMCpeHgz1sjE7LgN0XMyPW14Bz8x2qab8';
-const bot = new TelegramBot(BOT_TOKEN, { polling: true });
+const bot = new Telegraf(BOT_TOKEN);
 
 const CHUNK_SIZE = 49 * 1024 * 1024; // 49 MB
+const statusTracking = new Map();
+const progressCache = new Map();
+const app = express();
+const PORT = process.env.PORT || 3000;
 
-// Initialize SQLite database
-const db = new sqlite3.Database('file_processes.db');
+// Queue to manage editMessageText requests
+const requestQueue = [];
 
-// Create table if it doesn't exist
-db.run(`
-  CREATE TABLE IF NOT EXISTS file_processes (
-    chat_id INTEGER, 
-    file_name TEXT, 
-    status TEXT
-  )
-`);
+// Function to download the file
+const downloadFile = async (url, filePath, ctx, progressMessage) => {
+  const writer = fs.createWriteStream(filePath);
+  const response = await axios({
+    url,
+    method: 'GET',
+    responseType: 'stream',
+  });
 
-// Handle /start command
-bot.onText(/\/start/, (msg) => {
-  const chatId = msg.chat.id;
-  bot.sendMessage(chatId, "Please send me the file link.");
-});
+  const totalSize = parseInt(response.headers['content-length'], 10);
+  let downloadedSize = 0;
 
-// Handle plain text messages (expecting file link)
-bot.on('message', (msg) => {
-  const chatId = msg.chat.id;
+  response.data.on('data', (chunk) => {
+    writer.write(chunk);
+    downloadedSize += chunk.length;
+    enqueueEditMessageRequest(ctx, downloadedSize, totalSize, "Downloading", progressMessage);
+  });
 
-  if (msg.text && msg.text.startsWith('http')) {
-    const fileUrl = msg.text;
-    const fileName = path.basename(fileUrl);
-    const filePath = path.join(__dirname, fileName);
-
-    // Insert initial status into the database
-    db.run("INSERT INTO file_processes (chat_id, file_name, status) VALUES (?, ?, ?)", [chatId, fileName, 'Downloading the file...'], (err) => {
-      if (err) console.error(err);
+  return new Promise((resolve, reject) => {
+    response.data.on('end', () => {
+      writer.end();
+      resolve();
     });
 
-    bot.sendMessage(chatId, "Downloading the file, please wait...");
+    response.data.on('error', (err) => {
+      writer.end();
+      reject(err);
+    });
+  });
+};
 
-    downloadFile(fileUrl, filePath, chatId)
-      .then(() => {
-        fs.stat(filePath, (err, stats) => {
-          if (err) {
-            return bot.sendMessage(chatId, "Error occurred while processing the file.");
-          }
+// Function to split the file into chunks
+const splitFile = (filePath, chunkSize, ctx, progressMessage) => {
+  const fileSize = fs.statSync(filePath).size;
+  const numChunks = Math.ceil(fileSize / chunkSize);
+  const chunks = [];
 
-          if (stats.size > 50 * 1024 * 1024) { // Larger than 50 MB
-            updateStatus(chatId, 'Splitting file into chunks...');
-            bot.sendMessage(chatId, "The file is larger than 50 MB. Splitting it into chunks...");
+  for (let i = 0; i < numChunks; i++) {
+    const chunkFileName = `${filePath}.part${i + 1}`;
+    const start = i * chunkSize;
+    const end = Math.min(start + chunkSize, fileSize);
 
-            splitFile(filePath, CHUNK_SIZE)
-              .then((chunks) => {
-                sendChunks(chatId, chunks)
-                  .then(() => {
-                    cleanupChunks(chunks);
-                    updateStatus(chatId, 'Completed');
-                  })
-                  .catch(err => console.error(err));
-              })
-              .catch(err => console.error(err));
-          } else {
-            updateStatus(chatId, 'Sending file...');
-            bot.sendMessage(chatId, "The file is under 50 MB. Sending the file...");
+    fs.writeFileSync(chunkFileName, fs.readFileSync(filePath, { start, end }));
+    chunks.push(chunkFileName);
+    enqueueEditMessageRequest(ctx, i + 1, numChunks, "Splitting", progressMessage);
+  }
 
-            sendFile(chatId, filePath)
-              .then(() => {
-                updateStatus(chatId, 'Completed');
-                cleanupFile(filePath);
-              })
-              .catch(err => console.error(err));
-          }
-        });
-      })
-      .catch(err => {
-        console.error(err);
-        bot.sendMessage(chatId, "Error occurred while downloading the file.");
-      });
+  return chunks;
+};
+
+// Function to send the chunks
+const sendChunks = async (ctx, chunks, progressMessage) => {
+  const totalChunks = chunks.length;
+  for (let i = 0; i < totalChunks; i++) {
+    await ctx.replyWithDocument({ source: chunks[i] }, { caption: `Part ${i + 1} of ${totalChunks}` });
+    enqueueEditMessageRequest(ctx, i + 1, totalChunks, "Sending chunks", progressMessage);
+  }
+  enqueueEditMessageRequest(ctx, totalChunks, totalChunks, "All chunks sent", progressMessage);
+};
+
+// Queueing and handling function for `editMessageText` requests
+const enqueueEditMessageRequest = (ctx, current, total, stage, progressMessage) => {
+  const progress = Math.round((current / total) * 100);
+  const chatId = ctx.chat.id;
+
+  if (progressCache.get(chatId) !== progress) {
+    progressCache.set(chatId, progress);
+    statusTracking.set(chatId, `${stage}... ${progress}% completed`);
+
+    requestQueue.push(async () => {
+      try {
+        await ctx.telegram.editMessageText(chatId, progressMessage.message_id, undefined, `${stage}... ${progress}% completed`);
+      } catch (error) {
+        if (error.code === 429) {
+          const retryAfter = error.parameters.retry_after || 1;
+          console.log(`Rate limit exceeded. Retrying in ${retryAfter} seconds...`);
+          await delay(retryAfter * 1000);
+        } else {
+          console.error('Failed to update message:', error);
+        }
+      }
+    });
+  }
+
+  processQueue();
+};
+
+// Function to process the request queue with a delay
+const processQueue = async () => {
+  if (requestQueue.length > 0) {
+    const request = requestQueue.shift();
+    await request();
+    await delay(1000); // Delay between successive requests to avoid hitting the rate limit
+    processQueue();
+  }
+};
+
+// Delay function
+const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+// Start command
+bot.start((ctx) => {
+  ctx.reply('Please send me the file link.');
+  bot.on('text', async (ctx) => {
+    const fileUrl = ctx.message.text;
+    const chatId = ctx.chat.id;
+    const filePath = path.basename(fileUrl);
+
+    statusTracking.set(chatId, 'Downloading the file...');
+
+    const progressMessage = await ctx.reply('Downloading the file...');
+
+    try {
+      await downloadFile(fileUrl, filePath, ctx, progressMessage);
+      const fileSize = fs.statSync(filePath).size;
+
+      if (fileSize > 50 * 1024 * 1024) { // Larger than 50 MB
+        statusTracking.set(chatId, 'Splitting file into chunks...');
+        await ctx.telegram.editMessageText(ctx.chat.id, progressMessage.message_id, undefined, 'The file is larger than 50 MB. Splitting it into chunks...');
+        const chunks = splitFile(filePath, CHUNK_SIZE, ctx, progressMessage);
+        await sendChunks(ctx, chunks, progressMessage);
+        chunks.forEach((chunk) => fs.unlinkSync(chunk)); // Clean up chunks
+      } else {
+        statusTracking.set(chatId, 'Sending file...');
+        await ctx.telegram.editMessageText(ctx.chat.id, progressMessage.message_id, undefined, 'The file is under 50 MB. Sending the file...');
+        await ctx.replyWithDocument({ source: filePath });
+      }
+
+      fs.unlinkSync(filePath); // Clean up the downloaded file
+      statusTracking.set(chatId, 'Completed');
+      await ctx.telegram.editMessageText(ctx.chat.id, progressMessage.message_id, undefined, 'Process completed successfully.');
+    } catch (error) {
+      await ctx.telegram.editMessageText(ctx.chat.id, progressMessage.message_id, undefined, 'An error occurred: ' + error.message);
+      statusTracking.set(chatId, 'Error');
+    }
+  });
+});
+
+// Status command
+bot.command('status', (ctx) => {
+  const chatId = ctx.chat.id;
+  if (statusTracking.has(chatId)) {
+    ctx.reply(`Current status: ${statusTracking.get(chatId)}`);
+  } else {
+    ctx.reply('No ongoing tasks found.');
   }
 });
 
-// Download file
-function downloadFile(url, filePath, chatId) {
-  return new Promise((resolve, reject) => {
-    const file = fs.createWriteStream(filePath);
-    let receivedBytes = 0;
+// Set up express server for port configuration
+app.get('/', (req, res) => {
+  res.send('Telegram bot is running.');
+});
 
-    request.get(url)
-      .on('response', (response) => {
-        const totalBytes = parseInt(response.headers['content-length'], 10);
-        response.on('data', (chunk) => {
-          receivedBytes += chunk.length;
-          const progress = Math.floor((receivedBytes / totalBytes) * 100);
-          updateStatus(chatId, `Downloading... ${progress}% completed`);
-        });
-      })
-      .pipe(file)
-      .on('finish', () => {
-        file.close(() => resolve());
-      })
-      .on('error', (err) => {
-        fs.unlink(filePath, () => reject(err));
-      });
-  });
-}
+app.listen(PORT, () => {
+  console.log(`Server is running on port ${PORT}`);
+  bot.launch();
+});
 
-// Split file into chunks
-function splitFile(filePath, chunkSize) {
-  return new Promise((resolve, reject) => {
-    const chunks = [];
-    const fileSize = fs.statSync(filePath).size;
-    const numChunks = Math.ceil(fileSize / chunkSize);
-    const fileStream = fs.createReadStream(filePath, { highWaterMark: chunkSize });
-
-    let chunkIndex = 0;
-    fileStream.on('data', (chunk) => {
-      const chunkFileName = `${filePath}.part${chunkIndex + 1}`;
-      fs.writeFileSync(chunkFileName, chunk);
-      chunks.push(chunkFileName);
-      chunkIndex += 1;
-    });
-
-    fileStream.on('end', () => resolve(chunks));
-    fileStream.on('error', (err) => reject(err));
-  });
-}
-
-// Send chunks
-function sendChunks(chatId, chunks) {
-  return new Promise((resolve, reject) => {
-    const totalChunks = chunks.length;
-    let chunkIndex = 0;
-
-    const sendNextChunk = () => {
-      if (chunkIndex < totalChunks) {
-        const chunk = chunks[chunkIndex];
-        bot.sendDocument(chatId, chunk, { caption: `Part ${chunkIndex + 1} of ${totalChunks}` })
-          .then(() => {
-            updateStatus(chatId, `Sending chunks... ${(chunkIndex + 1)}/${totalChunks} completed`);
-            chunkIndex += 1;
-            sendNextChunk();
-          })
-          .catch(err => reject(err));
-      } else {
-        bot.sendMessage(chatId, "All chunks sent successfully.");
-        resolve();
-      }
-    };
-
-    sendNextChunk();
-  });
-}
-
-// Send full file
-function sendFile(chatId, filePath) {
-  return bot.sendDocument(chatId, filePath)
-    .then(() => bot.sendMessage(chatId, "File sent successfully."));
-}
-
-// Update status in the database
-function updateStatus(chatId, status) {
-  db.run("UPDATE file_processes SET status = ? WHERE chat_id = ?", [status, chatId], (err) => {
-    if (err) console.error(err);
-  });
-}
-
-// Cleanup chunk files
-function cleanupChunks(chunks) {
-  chunks.forEach(chunk => fs.unlinkSync(chunk));
-}
-
-// Cleanup original file
-function cleanupFile(filePath) {
-  fs.unlinkSync(filePath);
-}
-
-// Start the bot
-const PORT = process.env.PORT || 3000;
-bot.startPolling();
-console.log(`Bot is running on port ${PORT}`);
+// Graceful stop
+process.once('SIGINT', () => bot.stop('SIGINT'));
+process.once('SIGTERM', () => bot.stop('SIGTERM'));
